@@ -3,7 +3,10 @@ Binaries/
 Intermediate/
 Saved/
 DerivedDataCache/
-Build/
+Build/*
+!Build/Wasm/
+Build/Wasm/*
+!Build/Wasm/Template/
 Plugins/*/Binaries/
 Plugins/*/Intermediate/
 # Packaged web build
