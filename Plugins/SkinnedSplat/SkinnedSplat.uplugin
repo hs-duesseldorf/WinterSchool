@@ -1,0 +1,16 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Skinned Splat",
+	"Description": "Linear-blend / dual-quaternion skinning of a Gaussian splat by a skeletal mesh, rendered through Epic's GaussianSplat pipeline.",
+	"Category": "Rendering",
+	"CreatedBy": "WinterSchool",
+	"CanContainContent": false,
+	"Modules": [
+		{ "Name": "SkinnedSplat", "Type": "Runtime", "LoadingPhase": "PostConfigInit" }
+	],
+	"Plugins": [
+		{ "Name": "GaussianSplat", "Enabled": true }
+	]
+}
