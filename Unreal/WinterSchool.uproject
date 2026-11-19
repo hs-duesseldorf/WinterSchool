@@ -1,0 +1,112 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "",
+	"Category": "",
+	"Description": "",
+	"Modules": [
+		{
+			"Name": "WinterSchool",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine",
+				"AIModule",
+				"UMG"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ModelingToolsEditorMode",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "StateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "GameplayStateTree",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		},
+		{
+			"Name": "FullBodyIK",
+			"Enabled": true
+		},
+		{
+			"Name": "OnlineSubsystemUtils",
+			"Enabled": true,
+			"PlatformDenyList": [
+				"Wasm"
+			]
+		},
+		{
+			"Name": "OnlineSubsystemNull",
+			"Enabled": true,
+			"PlatformDenyList": [
+				"Wasm"
+			]
+		},
+		{
+			"Name": "GaussianSplat",
+			"Enabled": true
+		},
+		{
+			"Name": "SkinnedSplat",
+			"Enabled": true
+		},
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "AIAssistant",
+			"Enabled": false
+		},
+		{
+			"Name": "AllToolsets",
+			"Enabled": false
+		},
+		{
+			"Name": "ToolsetRegistry",
+			"Enabled": false
+		},
+		{
+			"Name": "LiveLink",
+			"Enabled": true,
+			"PlatformDenyList": [
+				"Wasm"
+			]
+		},
+		{
+			"Name": "PerformanceCaptureCore",
+			"Enabled": true,
+			"PlatformDenyList": [
+				"Wasm"
+			]
+		},
+		{
+			"Name": "CapturyLiveLink",
+			"Enabled": true,
+			"PlatformDenyList": [
+				"Wasm"
+			]
+		}
+	]
+}

@@ -1,0 +1,77 @@
+{
+ "2": {
+  "class_type": "LoadImage",
+  "_meta": {
+   "title": "Photo (optional)"
+  },
+  "inputs": {
+   "image": "Professor_hero.png"
+  }
+ },
+ "3": {
+  "class_type": "PSImage",
+  "_meta": {
+   "title": "1 \u00b7 Image"
+  },
+  "inputs": {
+   "run": "professor",
+   "prompt": "A man in his sixties with short, side-parted dark-blond hair going grey, a friendly lined face and blue eyes. He wears a navy-blue short-sleeved polo shirt, loose light-grey chino trousers, beige-grey sneakers and a black wristwatch on his left wrist.",
+   "photo_use": "reference",
+   "seed": 1,
+   "steps": 4,
+   "dry_run": true,
+   "photo": [
+    "2",
+    0
+   ]
+  }
+ },
+ "4": {
+  "class_type": "PSViews",
+  "_meta": {
+   "title": "2 \u00b7 Views"
+  },
+  "inputs": {
+   "pipe": [
+    "3",
+    0
+   ],
+   "orbit": "climb",
+   "views": "grey keyframes",
+   "seed": 1,
+   "frames": "auto",
+   "match_light": 0.7,
+   "shadow": 0.3
+  }
+ },
+ "5": {
+  "class_type": "PSVideo",
+  "_meta": {
+   "title": "3 \u00b7 360\u00b0 Video"
+  },
+  "inputs": {
+   "pipe": [
+    "4",
+    0
+   ],
+   "seed": 1,
+   "steps": 8
+  }
+ },
+ "6": {
+  "class_type": "PSSplat",
+  "_meta": {
+   "title": "4 \u00b7 Gaussian Splat"
+  },
+  "inputs": {
+   "pipe": [
+    "5",
+    0
+   ],
+   "height_m": 1.78,
+   "upscale": true,
+   "max_splats": 130000,
+   "train_steps": 2.0
+  }
+ }
+}

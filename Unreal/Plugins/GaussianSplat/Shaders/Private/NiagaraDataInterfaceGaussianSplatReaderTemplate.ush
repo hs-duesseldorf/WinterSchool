@@ -1,0 +1,223 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Plugin/GaussianSplat/Shared/GaussianSplatShared.h"
+
+#define GaussianViewData PrimaryView
+#include "/Plugin/GaussianSplat/Public/SphericalGaussianCommon.ush"
+#undef GaussianViewData
+
+int					{ParameterName}_NumSplats;
+int					{ParameterName}_IndexClamp;
+float3				{ParameterName}_BoundsMin;
+float3				{ParameterName}_BoundsMax;
+int					{ParameterName}_SHDegree;
+int					{ParameterName}_SHCoordinateSpace;
+
+uint				{ParameterName}_SplatFormat;
+uint				{ParameterName}_SplatDataStride;
+ByteAddressBuffer	{ParameterName}_SplatData;
+
+float3				{ParameterName}_PositionScale;
+float3				{ParameterName}_PositionBias;
+float3				{ParameterName}_ScaleScale;
+float3				{ParameterName}_ScaleBias;
+float4				{ParameterName}_ColorScale;
+float4				{ParameterName}_ColorBias;
+float3				{ParameterName}_SHScale;
+float3				{ParameterName}_SHBias;
+
+void GetNumSplats_{ParameterName}(out int NumSplats)
+{
+	NumSplats = {ParameterName}_NumSplats;
+}
+
+void GetBounds_{ParameterName}(out float3 BoundsMin, out float3 BoundsMax)
+{
+	BoundsMin = {ParameterName}_BoundsMin;
+	BoundsMax = {ParameterName}_BoundsMax;
+}
+
+void GetBaseData_{ParameterName}(in int Index, out float3 OutPosition, out float4 OutRotation, out float3 OutScale, out float OutOpacity)
+{
+	Index = clamp(Index, 0, {ParameterName}_IndexClamp);
+
+	const uint ReadOffset = Index * {ParameterName}_SplatDataStride;
+	if ({ParameterName}_SplatFormat == 0)
+	{
+		OutPosition	= asfloat({ParameterName}_SplatData.Load3(ReadOffset + FGaussianSplatShared::EFloat_PositionOffset));
+		OutScale	= asfloat({ParameterName}_SplatData.Load3(ReadOffset + FGaussianSplatShared::EFloat_ScaleOffset));
+		OutRotation	= asfloat({ParameterName}_SplatData.Load4(ReadOffset + FGaussianSplatShared::EFloat_RotationOffset));
+		OutOpacity	= asfloat({ParameterName}_SplatData.Load (ReadOffset + FGaussianSplatShared::EFloat_ColorOpacityOffset + 12u));
+	}
+	else
+	{
+		const uint4 QuantizedData = {ParameterName}_SplatData.Load4(ReadOffset);
+		const uint  QuantizedColor = {ParameterName}_SplatData.Load(ReadOffset + FGaussianSplatShared::EQuantized_ColorOpacityOffset);
+		OutPosition	= FGaussianSplatShared::Unpack_21_21_21(QuantizedData.xy, {ParameterName}_PositionScale, {ParameterName}_PositionBias);
+		OutScale	= FGaussianSplatShared::Unpack_11_11_10_Exp(QuantizedData.z, {ParameterName}_ScaleScale, {ParameterName}_ScaleBias);
+		OutRotation	= FGaussianSplatShared::UnpackQuat(QuantizedData.w);
+		OutOpacity	= FGaussianSplatShared::Unpack_8_8_8_8(QuantizedColor, {ParameterName}_ColorScale, {ParameterName}_ColorBias).w;
+	}
+}
+
+void GetSHDegree_{ParameterName}(out int SHDegree)
+{
+	SHDegree = {ParameterName}_SHDegree;
+}
+
+void GetSHCoefficient_{ParameterName}(in int Index, in int Coefficient, out float3 OutCoefficient)
+{
+	Index = clamp(Index, 0, {ParameterName}_IndexClamp);
+	const int SHDimension = ({ParameterName}_SHDegree + 1) * ({ParameterName}_SHDegree + 1);
+	OutCoefficient = 0.0f;
+	if (Coefficient < 0 || Coefficient >= SHDimension)
+	{
+		return;
+	}
+
+	const uint ReadOffset = Index * {ParameterName}_SplatDataStride;
+	if ({ParameterName}_SplatFormat == 0)
+	{
+		const uint Offset = Coefficient == 0 ? FGaussianSplatShared::EFloat_ColorOpacityOffset : FGaussianSplatShared::EFloat_Stride + (Coefficient - 1) * 12u;
+		OutCoefficient = asfloat({ParameterName}_SplatData.Load3(ReadOffset + Offset));
+	}
+	else
+	{
+		const uint Offset = Coefficient == 0 ? FGaussianSplatShared::EQuantized_ColorOpacityOffset : FGaussianSplatShared::EQuantized_Stride + (Coefficient - 1) * 4u;
+		const uint Packed = {ParameterName}_SplatData.Load(ReadOffset + Offset);
+		OutCoefficient = Coefficient == 0
+			? FGaussianSplatShared::Unpack_8_8_8_8(Packed, {ParameterName}_ColorScale, {ParameterName}_ColorBias).xyz
+			: FGaussianSplatShared::Unpack_8_8_8_8(Packed, float4({ParameterName}_SHScale, 0.0f), float4({ParameterName}_SHBias, 0.0f)).xyz;
+	}
+}
+
+// Linear color with sRGB is currently expected
+void CalculateColor_{ParameterName}(in int Index, in float3 Direction, out float3 OutColor)
+{
+	Index = clamp(Index, 0, {ParameterName}_IndexClamp);
+	if ({ParameterName}_SHCoordinateSpace == COORDINATE_SPACE_RH_RUB)
+	{
+		Direction = float3(Direction.y, Direction.z, -Direction.x);
+	}
+	else if ({ParameterName}_SHCoordinateSpace == COORDINATE_SPACE_RH_RDF)
+	{
+		Direction = float3(Direction.y, -Direction.z, Direction.x);
+	}
+
+	const uint SHDimension = ({ParameterName}_SHDegree + 1) * ({ParameterName}_SHDegree + 1);
+	float3 Coefs[16];
+
+	// Read in Coefs
+	const uint ReadOffset = Index * {ParameterName}_SplatDataStride;
+	if ({ParameterName}_SplatFormat == 0)
+	{
+		const uint ColorOffset = ReadOffset + FGaussianSplatShared::EFloat_ColorOpacityOffset;
+		Coefs[0] = asfloat({ParameterName}_SplatData.Load3(ColorOffset));
+
+		uint SHOffset = ReadOffset + FGaussianSplatShared::EFloat_Stride;
+		for ( uint i=1; i < SHDimension; ++i )
+		{
+			Coefs[i] = asfloat({ParameterName}_SplatData.Load3(SHOffset));
+			SHOffset += 12u;
+		}
+	}
+	else
+	{
+		const uint ColorOffset = ReadOffset + FGaussianSplatShared::EQuantized_ColorOpacityOffset;
+		Coefs[0] = FGaussianSplatShared::Unpack_8_8_8_8({ParameterName}_SplatData.Load(ColorOffset), {ParameterName}_ColorScale, {ParameterName}_ColorBias).xyz;
+
+		const float4 SHScale = float4({ParameterName}_SHScale, 0.0f);
+		const float4 SHBias  = float4({ParameterName}_SHBias,  0.0f);
+
+		uint SHOffset = ReadOffset + FGaussianSplatShared::EQuantized_Stride;
+		for ( uint i=1; i < SHDimension; ++i )
+		{
+			const uint PackedSH = {ParameterName}_SplatData.Load(SHOffset);
+			Coefs[i] = FGaussianSplatShared::Unpack_8_8_8_8(PackedSH, SHScale, SHBias).xyz;
+
+			SHOffset += 4u;
+		}
+	}
+
+
+	OutColor = FGaussianSplatSHConstants::SH_C0 * Coefs[0];
+	if ({ParameterName}_SHDegree >= 1)
+	{
+		const float X = Direction.x;
+		const float Y = Direction.y;
+		const float Z = Direction.z;
+
+		OutColor = OutColor
+			- FGaussianSplatSHConstants::SH_C1 * Y * Coefs[1]
+			+ FGaussianSplatSHConstants::SH_C1 * Z * Coefs[2]
+			- FGaussianSplatSHConstants::SH_C1 * X * Coefs[3]
+			;
+
+		if ({ParameterName}_SHDegree >= 2)
+		{
+			const float XX = X*X;
+			const float YY = Y*Y;
+			const float ZZ = Z*Z;
+			const float XY = X*Y;
+			const float XZ = X*Z;
+			const float YZ = Y*Z;
+
+			OutColor = OutColor
+				+ FGaussianSplatSHConstants::SH_C2_0 * XY * Coefs[4]
+				+ FGaussianSplatSHConstants::SH_C2_1 * YZ * Coefs[5]
+				+ FGaussianSplatSHConstants::SH_C2_2 * (2.0f * ZZ - XX - YY) * Coefs[6]
+				+ FGaussianSplatSHConstants::SH_C2_3 * XZ * Coefs[7]
+				+ FGaussianSplatSHConstants::SH_C2_4 * (XX - YY) * Coefs[8]
+				;
+
+			if ({ParameterName}_SHDegree >= 3)
+			{
+				OutColor = OutColor
+					+ FGaussianSplatSHConstants::SH_C3_0 * Y * (3.0f * XX - YY) * Coefs[9]
+					+ FGaussianSplatSHConstants::SH_C3_1 * XY * Z * Coefs[10]
+					+ FGaussianSplatSHConstants::SH_C3_2 * Y * (4.0f * ZZ - XX - YY) * Coefs[11]
+					+ FGaussianSplatSHConstants::SH_C3_3 * Z * (2.0f * ZZ - 3.0f * XX - 3.0f * YY) * Coefs[12]
+					+ FGaussianSplatSHConstants::SH_C3_4 * X * (4.0f * ZZ - XX - YY) * Coefs[13]
+					+ FGaussianSplatSHConstants::SH_C3_5 * Z * (XX - YY) * Coefs[14]
+					+ FGaussianSplatSHConstants::SH_C3_6 * X * (XX - 3.0f * YY) * Coefs[15]
+					;
+			}
+		}
+	}
+
+	// Clamp to minimum positive denormal 
+	OutColor = max(OutColor + 0.5f, 6.10352e-5);
+	// Convert sRGB -> Linear
+	OutColor = select(OutColor > 0.04045f, pow(OutColor * (1.0f / 1.055f) + 0.0521327f, 2.4f), OutColor * (1.0f / 12.92f));
+}
+
+void CalculateSpriteSizeRotation_{ParameterName}(float3 SimWorldPosition, float4 Rotation, float3 Scale, out bool IsVisible, out float2 SpriteSize, out float SpriteRotation)
+{
+	IsVisible = false;
+	SpriteSize = 0.0f;
+	SpriteRotation = 0.0f;
+	
+	const FLWCVector3 LwcWorldPosition = MakeLWCVector3(GetEngineOwnerLWCTile(), SimWorldPosition);
+	const float3 TranslatedWorldPosition = DFFastToTranslatedWorld(DFFromTileOffset_Hack(LwcWorldPosition), PrimaryView.PreViewTranslation);
+
+	const float4 ClipPosition = mul(float4(TranslatedWorldPosition, 1.0f), PrimaryView.TranslatedWorldToClip);
+	if (ClipPosition.w > 0.0f)
+	{
+		const float3x3 Covariance3D = SG_ComputeCovariance3D(Rotation, Scale);
+		const float3 Covariance2D = SG_CalcCovariance2D(TranslatedWorldPosition, Covariance3D);
+		
+		float2 SpriteSizePixels;
+		float SpriteRotationRadians;
+		if (SG_DecomposeCovarianceForSprite(Covariance2D, SpriteSizePixels, SpriteRotationRadians))
+		{
+			const float4x4 WorldToView = transpose(PrimaryView.TranslatedWorldToView);
+			const float3 ViewPosition = mul(WorldToView, float4(TranslatedWorldPosition, 1.0f)).xyz;
+			const float Focal = PrimaryView.ViewSizeAndInvSize.x * PrimaryView.ViewToClip._m00 / 2.0f;
+			
+			IsVisible = true;
+			SpriteSize.x = SpriteSizePixels.x * ViewPosition.z / Focal;
+			SpriteSize.y = SpriteSizePixels.y * ViewPosition.z / Focal;
+			SpriteRotation = SpriteRotationRadians * 57.29577951f;
+		}
+	}
+}

@@ -1,0 +1,84 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+
+#define GPU_SIMULATION 1
+#include "/Plugin/GaussianSplat/Shared/GaussianSplatShared.h"
+
+#include "/Plugin/FX/Niagara/Private/NiagaraParticleAccess.ush"
+
+int PositionRegister;
+int ScaleRegister;
+int RotationRegister;
+int ColorRegister;
+int VisibilityTagRegister;
+
+float3 DefaultPosition;
+float3 DefaultScale;
+float4 DefaultRotation;
+float4 DefaultColor;
+int DefaultVisibilityTag;
+int RendererVisibility;
+
+Buffer<uint> ParticleCountBuffer;
+uint ParticleCountOffset;
+uint ParticleCount;
+
+uint MaxSplats;
+uint SplatStride;
+RWByteAddressBuffer RWSplatBuffer;
+
+float4x4 WorkingColorSpaceToSRGB;
+
+// Particle colors are in linear space
+float EncodeColorChannel(float Linear)
+{
+	const float SRGB = Linear <= 0.0031308f ? Linear * 12.92f : 1.055f * pow(Linear, 1.0f / 2.4f) - 0.055f;
+	return (SRGB - 0.5f) / FGaussianSplatSHConstants::SH_C0;
+}
+
+void WriteSplatRecord(uint SplatIndex, float3 Position, float3 Scale, float4 Rotation, float3 SHCoefficient0, float Opacity)
+{
+	const uint WriteOffset = SplatIndex * SplatStride;
+	RWSplatBuffer.Store3(WriteOffset + FGaussianSplatShared::EFloat_PositionOffset, asuint(Position));
+	RWSplatBuffer.Store3(WriteOffset + FGaussianSplatShared::EFloat_ScaleOffset, asuint(Scale));
+	RWSplatBuffer.Store4(WriteOffset + FGaussianSplatShared::EFloat_RotationOffset, asuint(Rotation));
+	RWSplatBuffer.Store3(WriteOffset + FGaussianSplatShared::EFloat_ColorOpacityOffset, asuint(SHCoefficient0));
+	RWSplatBuffer.Store(WriteOffset + FGaussianSplatShared::EFloat_ColorOpacityOffset + 12u, asuint(Opacity));
+}
+
+void WriteInactiveSplat(uint SplatIndex)
+{
+	WriteSplatRecord(SplatIndex, 0, 0, float4(0, 0, 0, 1), 0, 0);
+}
+
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void MainCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
+{
+	const uint SplatIndex = GetUnWrappedDispatchThreadId(GroupId, GroupThreadIndex, THREADGROUP_SIZE_1D);
+	if (SplatIndex >= MaxSplats)
+	{
+		return;
+	}
+
+	const uint LiveParticleCount = ParticleCountOffset != 0xFFFFFFFFu ? ParticleCountBuffer[ParticleCountOffset] : ParticleCount;
+	if (SplatIndex >= LiveParticleCount || NiagaraSafeGetInt(VisibilityTagRegister, SplatIndex, DefaultVisibilityTag) != RendererVisibility)
+	{
+		WriteInactiveSplat(SplatIndex);
+		return;
+	}
+
+	const float3 Position = NiagaraSafeGetVec3(PositionRegister, SplatIndex, DefaultPosition);
+	const float3 Scale = NiagaraSafeGetVec3(ScaleRegister, SplatIndex, DefaultScale);
+	const float4 Color = NiagaraSafeGetVec4(ColorRegister, SplatIndex, DefaultColor);
+	
+	float4 Rotation = NiagaraSafeGetVec4(RotationRegister, SplatIndex, DefaultRotation);
+	const float RotationLengthSq = dot(Rotation, Rotation);
+	Rotation = RotationLengthSq > 1.0e-8f ? Rotation * rsqrt(RotationLengthSq) : float4(0, 0, 0, 1);
+
+	const float3 ColorSRGB = mul(Color.rgb, (float3x3)WorkingColorSpaceToSRGB);
+	const float3 SHCoefficient0 = float3(EncodeColorChannel(ColorSRGB.r), EncodeColorChannel(ColorSRGB.g), EncodeColorChannel(ColorSRGB.b));
+
+	WriteSplatRecord(SplatIndex, Position, abs(Scale), Rotation, SHCoefficient0, Color.a);
+}

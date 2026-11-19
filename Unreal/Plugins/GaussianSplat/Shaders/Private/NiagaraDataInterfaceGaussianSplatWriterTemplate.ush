@@ -1,0 +1,172 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Gaussian Splat Writer data interface. Writes splats into the instance's splat buffer, in either the float or the
+// quantized layout of the GaussianSplat plugin. It reads nothing but its own buffer.
+
+#include "/Plugin/GaussianSplat/Shared/GaussianSplatShared.h"
+
+int					{ParameterName}_NumSplats;
+uint				{ParameterName}_OutputFormat;
+uint				{ParameterName}_OutputStride;
+uint				{ParameterName}_SHDimension;
+
+RWByteAddressBuffer	{ParameterName}_SplatData;
+
+float3				{ParameterName}_PositionScale;
+float3				{ParameterName}_PositionBias;
+float3				{ParameterName}_ScaleScale;
+float3				{ParameterName}_ScaleBias;
+float4				{ParameterName}_ColorScale;
+float4				{ParameterName}_ColorBias;
+float3				{ParameterName}_SHScale;
+float3				{ParameterName}_SHBias;
+
+// Working color space -> sRGB primaries, row vector convention.
+float4x4			{ParameterName}_WorkingColorSpaceToSRGB;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helpers
+
+bool ValidateIndex_{ParameterName}(inout int Index)
+{
+	const bool bValid = Index >= 0 && Index < {ParameterName}_NumSplats;
+	Index = clamp(Index, 0, max({ParameterName}_NumSplats - 1, 0));
+	return bValid;
+}
+
+// Splat shading decodes a color as SH_C0 * Coefficient + 0.5, then sRGB -> linear -> working color space. Particle colors
+// are linear working space, so this runs that chain backwards.
+float3 EncodeLinearColor_{ParameterName}(float3 LinearColor)
+{
+	const float3 SRGBLinear = mul(LinearColor, (float3x3){ParameterName}_WorkingColorSpaceToSRGB);
+	const float3 SRGB = select(SRGBLinear <= 0.0031308f, SRGBLinear * 12.92f, 1.055f * pow(max(SRGBLinear, 0.0f), 1.0f / 2.4f) - 0.055f);
+	return (SRGB - 0.5f) / FGaussianSplatSHConstants::SH_C0;
+}
+
+void StoreBaseData_{ParameterName}(int Index, float3 Position, float4 Rotation, float3 Scale)
+{
+	const uint WriteOffset = Index * {ParameterName}_OutputStride;
+
+	// Unit quaternions are expected
+	const float RotationLengthSq = dot(Rotation, Rotation);
+	Rotation = RotationLengthSq > 0.0f ? Rotation * rsqrt(RotationLengthSq) : float4(0.0f, 0.0f, 0.0f, 1.0f);
+
+	if ({ParameterName}_OutputFormat == 0)
+	{
+		{ParameterName}_SplatData.Store3(WriteOffset + FGaussianSplatShared::EFloat_PositionOffset, asuint(Position));
+		{ParameterName}_SplatData.Store3(WriteOffset + FGaussianSplatShared::EFloat_ScaleOffset, asuint(abs(Scale)));
+		{ParameterName}_SplatData.Store4(WriteOffset + FGaussianSplatShared::EFloat_RotationOffset, asuint(Rotation));
+	}
+	else
+	{
+		{ParameterName}_SplatData.Store2(WriteOffset + FGaussianSplatShared::EQuantized_PositionOffset, FGaussianSplatShared::Pack_21_21_21(Position, {ParameterName}_PositionScale, {ParameterName}_PositionBias));
+		{ParameterName}_SplatData.Store (WriteOffset + FGaussianSplatShared::EQuantized_ScaleOffset, FGaussianSplatShared::Pack_11_11_10_Exp(abs(Scale), {ParameterName}_ScaleScale, {ParameterName}_ScaleBias));
+		{ParameterName}_SplatData.Store (WriteOffset + FGaussianSplatShared::EQuantized_RotationOffset, FGaussianSplatShared::PackQuat(Rotation));
+	}
+}
+
+void StoreOpacity_{ParameterName}(int Index, float Opacity)
+{
+	const uint WriteOffset = Index * {ParameterName}_OutputStride;
+	if ({ParameterName}_OutputFormat == 0)
+	{
+		{ParameterName}_SplatData.Store(WriteOffset + FGaussianSplatShared::EFloat_ColorOpacityOffset + 12u, asuint(Opacity));
+	}
+	else
+	{
+		// Opacity is the low byte of the color word
+		const uint ColorOffset = WriteOffset + FGaussianSplatShared::EQuantized_ColorOpacityOffset;
+		const uint ColorWord = {ParameterName}_SplatData.Load(ColorOffset);
+		const uint OpacityByte = FGaussianSplatShared::Quantize(Opacity, {ParameterName}_ColorScale.w, {ParameterName}_ColorBias.w, 0xffu);
+		{ParameterName}_SplatData.Store(ColorOffset, (ColorWord & 0xffffff00u) | OpacityByte);
+	}
+}
+
+// Coefficient 0 is the degree zero spherical harmonic, i.e. the encoded color; 1 and up are the higher bands
+void StoreCoefficient_{ParameterName}(int Index, uint Coefficient, float3 Value)
+{
+	const uint WriteOffset = Index * {ParameterName}_OutputStride;
+	if ({ParameterName}_OutputFormat == 0)
+	{
+		const uint Offset = Coefficient == 0 ? FGaussianSplatShared::EFloat_ColorOpacityOffset : FGaussianSplatShared::EFloat_Stride + (Coefficient - 1) * 12u;
+		{ParameterName}_SplatData.Store3(WriteOffset + Offset, asuint(Value));
+	}
+	else if (Coefficient == 0)
+	{
+		const uint ColorOffset = WriteOffset + FGaussianSplatShared::EQuantized_ColorOpacityOffset;
+		const uint ColorWord = {ParameterName}_SplatData.Load(ColorOffset);
+		const uint PackedColor = FGaussianSplatShared::Pack_8_8_8_8(float4(Value, 0.0f), {ParameterName}_ColorScale, {ParameterName}_ColorBias);
+		{ParameterName}_SplatData.Store(ColorOffset, (PackedColor & 0xffffff00u) | (ColorWord & 0xffu));
+	}
+	else
+	{
+		const uint Packed = FGaussianSplatShared::Pack_8_8_8_8(float4(Value, 0.0f), float4({ParameterName}_SHScale, 0.0f), float4({ParameterName}_SHBias, 0.0f));
+		{ParameterName}_SplatData.Store(WriteOffset + FGaussianSplatShared::EQuantized_Stride + (Coefficient - 1) * 4u, Packed);
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Script functions
+
+void GetNumSplats_{ParameterName}(out int NumSplats)
+{
+	NumSplats = {ParameterName}_NumSplats;
+}
+
+void GetSHDegree_{ParameterName}(out int SHDegree)
+{
+	SHDegree = {ParameterName}_SHDimension >= 16 ? 3 : {ParameterName}_SHDimension >= 9 ? 2 : {ParameterName}_SHDimension >= 4 ? 1 : 0;
+}
+
+void SetSplat_{ParameterName}_UEImpureCall(bool bExecute, int Index, float3 Position, float4 Rotation, float3 Scale, float4 Color, out bool bSuccess)
+{
+	bSuccess = bExecute && ValidateIndex_{ParameterName}(Index);
+	if (bSuccess)
+	{
+		StoreBaseData_{ParameterName}(Index, Position, Rotation, Scale);
+		StoreCoefficient_{ParameterName}(Index, 0, EncodeLinearColor_{ParameterName}(Color.rgb));
+		StoreOpacity_{ParameterName}(Index, Color.a);
+		for (uint Coefficient = 1; Coefficient < {ParameterName}_SHDimension; ++Coefficient)
+		{
+			StoreCoefficient_{ParameterName}(Index, Coefficient, 0.0f);
+		}
+	}
+}
+
+void SetBaseData_{ParameterName}_UEImpureCall(bool bExecute, int Index, float3 Position, float4 Rotation, float3 Scale, out bool bSuccess)
+{
+	bSuccess = bExecute && ValidateIndex_{ParameterName}(Index);
+	if (bSuccess)
+	{
+		StoreBaseData_{ParameterName}(Index, Position, Rotation, Scale);
+	}
+}
+
+void SetColor_{ParameterName}_UEImpureCall(bool bExecute, int Index, float4 Color, out bool bSuccess)
+{
+	bSuccess = bExecute && ValidateIndex_{ParameterName}(Index);
+	if (bSuccess)
+	{
+		StoreCoefficient_{ParameterName}(Index, 0, EncodeLinearColor_{ParameterName}(Color.rgb));
+		StoreOpacity_{ParameterName}(Index, Color.a);
+	}
+}
+
+void SetOpacity_{ParameterName}_UEImpureCall(bool bExecute, int Index, float Opacity, out bool bSuccess)
+{
+	bSuccess = bExecute && ValidateIndex_{ParameterName}(Index);
+	if (bSuccess)
+	{
+		StoreOpacity_{ParameterName}(Index, Opacity);
+	}
+}
+
+// Raw coefficient, as a reader hands it out: 0 is the color coefficient, 1 and up the higher bands
+void SetSHCoefficient_{ParameterName}_UEImpureCall(bool bExecute, int Index, int Coefficient, float3 Value, out bool bSuccess)
+{
+	bSuccess = bExecute && ValidateIndex_{ParameterName}(Index) && Coefficient >= 0 && uint(Coefficient) < {ParameterName}_SHDimension;
+	if (bSuccess)
+	{
+		StoreCoefficient_{ParameterName}(Index, uint(Coefficient), Value);
+	}
+}

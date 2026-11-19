@@ -1,0 +1,65 @@
+// Splat shadow lookup for the sun's light function (WinterSchool fork), see GaussianSplatShadow.cpp.
+//
+// The light function material (/GaussianSplat/Shadow/M_GaussianSplatShadow) calls this from a Custom node:
+//     return GaussianSplatShadow(WorldPosition, ShadowMap, ShadowParams, View.FrameNumber).xxx;
+//
+// ShadowParams (one row of texels, written every frame the map is drawn):
+//     [0]          frame number (mod 2^24), cascade count, cascade resolution, -
+//     [1 + 4 i]    world -> texel x of cascade i
+//     [2 + 4 i]    world -> texel y
+//     [3 + 4 i]    world -> depth in [0, 1]
+//     [4 + 4 i]    depth bias, 1 / depth fade, -, -
+// ShadowMap: the cascades side by side; r = transmittance, a = nearest occluder depth.
+
+#pragma once
+
+float GaussianSplatShadow(float3 WorldPosition, Texture2D ShadowMap, Texture2D ShadowParams, uint FrameNumber)
+{
+	const float4 Header = ShadowParams.Load(int3(0, 0, 0));
+	// Not drawn this frame (no casters, other view family): no splat shadow
+	if (abs(Header.x - (float)(FrameNumber & 0xFFFFFFu)) > 0.5f)
+	{
+		return 1.0f;
+	}
+
+	const int NumCascades = (int)Header.y;
+	const float Resolution = Header.z;
+	for (int Cascade = 0; Cascade < NumCascades; ++Cascade)
+	{
+		const int Row = 1 + 4 * Cascade;
+		const float4 RowU = ShadowParams.Load(int3(Row, 0, 0));
+		const float4 RowV = ShadowParams.Load(int3(Row + 1, 0, 0));
+		const float2 Texel = float2(dot(RowU.xyz, WorldPosition) + RowU.w, dot(RowV.xyz, WorldPosition) + RowV.w);
+		if (any(Texel < 1.0f) || any(Texel > Resolution - 1.0f))
+		{
+			continue;
+		}
+
+		const float4 RowDepth = ShadowParams.Load(int3(Row + 2, 0, 0));
+		const float4 Bias = ShadowParams.Load(int3(Row + 3, 0, 0));
+		const float Depth = dot(RowDepth.xyz, WorldPosition) + RowDepth.w;
+
+		// Bilinear over the per-texel results
+		const float2 T = Texel - 0.5f;
+		const float2 Base = floor(T);
+		const float2 Frac = T - Base;
+		const int2 SlotOffset = int2(Cascade * (int)Resolution, 0);
+		float4 Lit;
+		for (int Tap = 0; Tap < 4; ++Tap)
+		{
+			const float4 Map = ShadowMap.Load(int3(int2(Base) + int2(Tap & 1, Tap >> 1) + SlotOffset, 0));
+			const float Occluded = saturate((Depth - Map.a - Bias.x) * Bias.y);
+			Lit[Tap] = lerp(1.0f, Map.r, Occluded);
+		}
+		float Shadow = lerp(lerp(Lit.x, Lit.y, Frac.x), lerp(Lit.z, Lit.w, Frac.x), Frac.y);
+
+		// Fade out towards the border of the last cascade
+		if (Cascade == NumCascades - 1)
+		{
+			const float2 Border = min(Texel, Resolution - Texel) / (0.1f * Resolution);
+			Shadow = lerp(1.0f, Shadow, saturate(min(Border.x, Border.y)));
+		}
+		return Shadow;
+	}
+	return 1.0f;
+}

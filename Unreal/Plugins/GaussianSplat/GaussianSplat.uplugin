@@ -1,0 +1,67 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Gaussian Splat",
+	"Description": "Gaussian Splat asset and ES3.1+ rendering.",
+	"Category": "Rendering",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EnabledByDefault": false,
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "GaussianSplat",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "GaussianSplatShader",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "GaussianSplatSceneViewExtension",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "GaussianSplatEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "GaussianSplatNiagara",
+			"Type": "Runtime",
+			"LoadingPhase": "None"
+		},
+		{
+			"Name": "GaussianSplatNiagaraShader",
+			"Type": "Runtime",
+			"LoadingPhase": "None"
+		},
+		{
+			"Name": "GaussianSplatNiagaraEditor",
+			"Type": "Editor",
+			"LoadingPhase": "None"
+		},
+		{
+			"Name": "GaussianSplatTests",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "Niagara",
+			"Enabled": false,
+			"Optional": true
+		}
+	]
+}

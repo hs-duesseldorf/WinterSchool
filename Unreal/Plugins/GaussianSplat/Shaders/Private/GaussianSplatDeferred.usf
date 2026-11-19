@@ -1,0 +1,158 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// GBuffer path (WinterSchool fork): resolves the splats accumulated by MainPS_Deferred (GaussianSplatHardwareRasterize.usf)
+// into one opaque surface per pixel of the base pass outputs, right after the base pass, so the renderer's own lighting
+// (every light with its shadows, sky light, reflections), fog, AO and temporal AA treat splats like any opaque surface.
+// Works on both deferred renderers: the desktop one (SM5, also WebGPU SM5) and mobile deferred (also WebGPU ES3.1
+// deferred); EncodeGBuffer writes the layout of the one it is compiled for.
+//
+// A captured splat colour already contains all the lighting of the capture, so the sun's shadows are projected onto the
+// splats rather than lit from their (noisy) normals: the GBuffer normal faces the sun, N.L = 1 everywhere. The colour is
+// split by the share S of it that the sun's shadow takes away (the component's ShadowStrength * LightingStrength *
+// r.GaussianSplat.Lighting.ShadowStrength), with Sun = the directional light (colour * intensity / pi) and Sky = the sky
+// light's diffuse irradiance (captured SH * colour * intensity):
+//   Kept     = (1 - S) * lerp(1, Hue, S),  Hue = Sky / (Sun + Sky) normalised to luminance 1 (a shadow is lit by the sky)
+//   Albedo   = min((1 - Kept) * Color / Sun, 1)   (per channel, see r.GaussianSplat.Lighting.ShowClipping)
+//   Emission = Color - Albedo * Sun,  GBuffer AO = 0   (the rest stays baked in: no sky light / GI / reflections)
+// Unshadowed this reproduces the captured colour; a full shadow of the directional light keeps Kept of it. So the shadow's
+// darkness is a setting of its own and its hue follows the lights' colours (a bluer sky or warmer sun, bluer shadows),
+// while the sun's intensity sets how bright the capture's sun is taken to be: the albedo's scale, i.e. how much other
+// lights (which add Albedo * light as if the surface faced the sun) brighten it.
+
+// Pixels that do not become a GBuffer surface (low coverage: soft edges, thin floaters, sky) get the splats composited
+// unlit over what is behind them instead (REMAINDER permutation, blended into SceneColor), so they never show holes.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/ReflectionEnvironmentShared.ush"
+#include "/Engine/Private/RandomInterleavedGradientNoise.ush"
+
+#ifndef WRITE_VELOCITY
+#define WRITE_VELOCITY 0
+#endif
+
+#ifndef REMAINDER
+#define REMAINDER 0
+#endif
+
+// Accumulated front to back, .a = transmittance left after all splats of the pixel
+Texture2D<float4> SplatColorTexture;            // rgb: premultiplied colour * PreExposure
+Texture2D<float4> SplatDepthAndLightingTexture; // r: linear depth / ExpectedDepthScale * depth weight, g: lighting strength * alpha, b: depth weight
+Texture2D<float4> SplatNormalTexture;           // rgb: world normal * alpha
+
+float ExpectedDepthScale;
+float CoverageThreshold;
+uint DitheredCoverage;
+float GBufferSpecular;
+float GBufferRoughness;
+float ShadowStrength;
+float SurfaceOffset;
+uint ShowClipping;
+
+// True if the pixel becomes the splat surface in the GBuffer. The GBuffer holds one opaque surface per pixel: a partly
+// covered pixel becomes it with a probability of its coverage (dithered, like a dithered opacity mask, resolved by
+// temporal AA) or above a threshold. Both resolve passes make the same decision.
+bool IsSplatSurface(float2 SvPositionXY, float Coverage)
+{
+	const float Threshold = DitheredCoverage != 0u ? InterleavedGradientNoise(SvPositionXY, float(View.StateFrameIndexMod8)) : CoverageThreshold;
+	return Coverage > 1e-3f && Coverage >= Threshold;
+}
+
+// Unlit composite of the pixels that are no splat surface: SceneColor = Color + SceneColor * Transmittance
+void RemainderPS(float4 SvPosition : SV_Position, out float4 OutSceneColor : SV_Target0)
+{
+	const float4 Color = SplatColorTexture.Load(int3((int2)SvPosition.xy, 0));
+	if (IsSplatSurface(SvPosition.xy, 1.0f - Color.a) || Color.a >= 1.0f)
+	{
+		discard;
+	}
+	OutSceneColor = Color;
+}
+
+void MainPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutSceneColor : SV_Target0,
+	out float4 OutGBufferA : SV_Target1,
+	out float4 OutGBufferB : SV_Target2,
+	out float4 OutGBufferC : SV_Target3,
+#if WRITE_VELOCITY
+	out float4 OutVelocity : SV_Target4,
+#endif
+	out float OutDepth : SV_Depth)
+{
+	const int3 Pixel = int3((int2)SvPosition.xy, 0);
+	const float4 Color = SplatColorTexture.Load(Pixel);
+	const float Coverage = 1.0f - Color.a;
+
+	if (!IsSplatSurface(SvPosition.xy, Coverage))
+	{
+		discard;
+	}
+	const float InvCoverage = 1.0f / Coverage;
+
+	const float4 DepthAndLighting = SplatDepthAndLightingTexture.Load(Pixel);
+	const float ExpectedDepth = DepthAndLighting.r / max(DepthAndLighting.b, 1e-7f) * ExpectedDepthScale;
+	const float LightingStrength = saturate(DepthAndLighting.g * InvCoverage);
+
+	float3 N = SplatNormalTexture.Load(Pixel).rgb;
+	N = dot(N, N) > 1e-8f ? normalize(N) : -View.ViewForward;
+
+	// The expected depth averages every splat seen through the pixel, so on a fuzzy surface it lies inside the fuzz,
+	// behind what is seen, and shadows cast on it look sunk in. Lift the surface by SurfaceOffset along its normal,
+	// moving it towards the camera along the pixel's ray (clamped at grazing angles).
+	const float3 RayDir = normalize(SvPositionToTranslatedWorld(float4(SvPosition.xy, ConvertToDeviceZ(ExpectedDepth), 1.0f)) - View.TranslatedWorldCameraOrigin);
+	const float RayLift = SurfaceOffset / max(dot(N, -RayDir), 0.25f);
+	const float SceneDepth = max(ExpectedDepth - RayLift * dot(RayDir, View.ViewForward), ExpectedDepth * 0.5f);
+
+	const float3 Radiance = Color.rgb * InvCoverage * View.OneOverPreExposure;
+	// The sun's share of the captured colour goes into the GBuffer as albedo, lit by the directional light (so its shadow
+	// takes it away), the rest stays as emission. How dark a full shadow is, is a setting: S = LightingStrength (the
+	// component's LightingStrength * ShadowStrength) * r.GaussianSplat.Lighting.ShadowStrength; the light's intensity only
+	// sets the albedo's scale (how strongly other lights brighten the splat). The shadow's hue comes from the lights, as a
+	// real shadow is lit by the sky alone: Sky / (Sun + Sky) per channel, normalised to luminance 1, blended in with S.
+	// DirectionalLightColor is the Lambert radiance per unit albedo of a surface facing the sun (it has the 1/pi).
+	const float3 SunIrradiance = View.DirectionalLightColor.rgb;
+	const float3 SkyIrradiance = GetSkySHDiffuse(View.DirectionalLightDirection) * View.SkyLightColor.rgb;
+	const float S = saturate(ShadowStrength * LightingStrength);
+	const float3 SkyShare = SkyIrradiance / max(SunIrradiance + SkyIrradiance, 1e-6f);
+	const float3 Hue = Luminance(SkyShare) > 1e-4f ? SkyShare / Luminance(SkyShare) : 1.0f;
+	// What a full shadow keeps, per channel, and so the sun's share of each channel
+	const float3 Kept = saturate((1.0f - S) * lerp(1.0f, Hue, S));
+	const float3 Albedo = (1.0f - Kept) * Radiance / max(SunIrradiance, 1e-6f);
+	// An albedo above 1 (that channel's sun too weak for its share) cannot be stored: clamp it per channel, which keeps
+	// more of that channel in the shadow (a sun without blue cannot take blue away) but leaves the others alone
+	const float3 BaseColor = min(Albedo, 1.0f);
+	float3 Emission = max(Radiance - BaseColor * SunIrradiance, 0.0f);
+	if (ShowClipping != 0u && any(Albedo > 1.0f))
+	{
+		Emission = lerp(Emission, float3(1.0f, 0.0f, 1.0f) * max(Luminance(Radiance), 0.1f), 0.7f);
+	}
+
+	OutSceneColor = float4(Emission * View.PreExposure, 0.0f);
+
+	FGBufferData GBuffer = (FGBufferData)0;
+	GBuffer.WorldNormal = View.DirectionalLightDirection;
+	GBuffer.BaseColor = BaseColor;
+	GBuffer.Metallic = 0.0f;
+	GBuffer.Specular = GBufferSpecular;
+	GBuffer.Roughness = GBufferRoughness;
+	GBuffer.ShadingModelID = SHADINGMODELID_DEFAULT_LIT;
+	// No baked shadowing; velocity is the camera's (static splats), reconstructed from depth
+	GBuffer.SelectiveOutputMask = SKIP_PRECSHADOW_MASK | SKIP_VELOCITY_MASK;
+	// The capture's indirect light is in the emission: no sky light, GI or reflections on top
+	GBuffer.GBufferAO = 0.0f;
+	GBuffer.IndirectIrradiance = 1.0f;
+	GBuffer.PrecomputedShadowFactors = 1.0f;
+
+	float4 OutGBufferD;
+	float4 OutGBufferE;
+	float4 OutGBufferVelocity;
+	EncodeGBuffer(GBuffer, OutGBufferA, OutGBufferB, OutGBufferC, OutGBufferD, OutGBufferE, OutGBufferVelocity);
+
+#if WRITE_VELOCITY
+	// 0 = no object motion, the velocity of the camera is reconstructed from depth
+	OutVelocity = 0.0f;
+#endif
+
+	OutDepth = ConvertToDeviceZ(SceneDepth);
+}

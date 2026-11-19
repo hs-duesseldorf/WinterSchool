@@ -1,0 +1,254 @@
+// Splat shadow map (WinterSchool fork), see GaussianSplatShadow.cpp.
+//
+// Every shadow casting splat is drawn into an orthographic cascade of the sun, unsorted: the colour channels multiply
+// up the transmittance (1 - alpha) of everything in a texel, alpha keeps the nearest depth of the fairly opaque
+// splats (min blend). The sun's light function (Public/GaussianSplatShadow.ush) reads both.
+
+#include "/Engine/Private/Common.ush"
+
+#ifndef GAUSSIAN_SPLAT_SHADOW_MAX_PARAMS
+#define GAUSSIAN_SPLAT_SHADOW_MAX_PARAMS 32
+#endif
+
+// World -> cascade: texel x and y, depth in [0, 1]
+float4 CascadeU;
+float4 CascadeV;
+float4 CascadeDepth;
+float CascadeResolution;
+
+#if COMPUTESHADER
+
+// Splat decoding, the cluster table and the group prefix sum of the shading pass
+#include "GaussianSplatShading.usf"
+
+uint NumClusters;
+float TexelWorldSize;
+float ErrorThreshold;
+
+RWBuffer<uint> RWClusterOutputBuffer;
+RWBuffer<uint> RWClusterCount;
+
+float ClusterErrorTexels(uint ClusterIndex, float MinScale)
+{
+	return ClusterBuffer[ClusterIndex].Error * MinScale / TexelWorldSize;
+}
+
+// Half extent of a local box along a world axis
+float ProjectedExtent(float3 LocalExtent, float3 WorldAxis)
+{
+	return dot(abs(float3(dot(LocalToWorld[0].xyz, WorldAxis), dot(LocalToWorld[1].xyz, WorldAxis), dot(LocalToWorld[2].xyz, WorldAxis))), LocalExtent);
+}
+
+// Clusters overlapping the cascade, at the level of detail of its texel size
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void CullClustersCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
+{
+	const uint ClusterIndex = GetUnWrappedDispatchThreadId(GroupId, GroupThreadIndex, THREADGROUP_SIZE_1D);
+	if (ClusterIndex >= NumClusters)
+	{
+		return;
+	}
+
+	const FGaussianSplatCluster Cluster = ClusterBuffer[ClusterIndex];
+	const float3 Center = mul(float4(0.5f * (Cluster.BoundsMax + Cluster.BoundsMin), 1.0f), LocalToWorld).xyz;
+	const float3 Extent = 0.5f * (Cluster.BoundsMax - Cluster.BoundsMin) * max(1.0f, PointScaleFactor);
+
+	const float U = dot(CascadeU.xyz, Center) + CascadeU.w;
+	const float V = dot(CascadeV.xyz, Center) + CascadeV.w;
+	const float D = dot(CascadeDepth.xyz, Center) + CascadeDepth.w;
+	const float ExtentU = ProjectedExtent(Extent, CascadeU.xyz);
+	const float ExtentV = ProjectedExtent(Extent, CascadeV.xyz);
+	const float ExtentD = ProjectedExtent(Extent, CascadeDepth.xyz);
+
+	bool bVisible = U + ExtentU >= 0.0f && U - ExtentU <= CascadeResolution
+		&& V + ExtentV >= 0.0f && V - ExtentV <= CascadeResolution
+		&& D - ExtentD <= 1.0f;
+	if (bVisible)
+	{
+		const float MinScale = min3(length(LocalToWorld[0].xyz), length(LocalToWorld[1].xyz), length(LocalToWorld[2].xyz));
+		const float Error = ClusterErrorTexels(ClusterIndex, MinScale);
+		const float ParentError = (Cluster.ParentIndex == ~0u) ? POSITIVE_INFINITY : ClusterErrorTexels(Cluster.ParentIndex, MinScale);
+		bVisible = (ErrorThreshold >= Error) && (ErrorThreshold < ParentError);
+	}
+
+	if (bVisible)
+	{
+		uint WriteIndex = 0;
+		InterlockedAdd(RWClusterCount[0], 1u, WriteIndex);
+		RWClusterOutputBuffer[WriteIndex] = ClusterIndex;
+	}
+}
+
+uint2 DimensionLimit;
+RWBuffer<uint> RWDispatchIndirectArgs;
+
+[numthreads(1, 1, 1)]
+void DispatchArgsCS()
+{
+	WriteDispatchIndirectArgs(RWDispatchIndirectArgs, 0, GetGroupCountWrapped(ClusterCountBuffer[0], DimensionLimit));
+}
+
+uint UseClusters;
+uint MaxShadowSplats;
+RWStructuredBuffer<uint4> RWShadowSplats;
+RWBuffer<uint> RWShadowSplatCount;
+
+uint PackUnorm16x2(float2 V)
+{
+	const uint2 Q = (uint2)round(saturate(V) * 65535.0f);
+	return Q.x | (Q.y << 16);
+}
+
+// Projects the splats into the cascade and appends the ones that touch it: centre (texels, unorm16 over [-R/2, 3R/2]),
+// both ellipse axes (texels, half), depth and opacity (unorm16)
+[numthreads(THREADGROUP_SIZE_1D, 1, 1)]
+void ProjectSplatsCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
+{
+	uint LocalClusterCount = 1;
+	FGaussianSplatCluster Cluster = (FGaussianSplatCluster)0;
+	if (UseClusters != 0u)
+	{
+		const uint ClusterIndex = GetUnWrappedDispatchGroupId(GroupId);
+		if (ClusterIndex >= ClusterCountBuffer[0])
+		{
+			return;
+		}
+		Cluster = ClusterBuffer[ClusterIndexBuffer[ClusterIndex]];
+		LocalClusterCount = DivideAndRoundUp(Cluster.SplatCount, (uint)THREADGROUP_SIZE_1D);
+	}
+
+	for (uint LocalClusterIndex = 0; LocalClusterIndex < LocalClusterCount; ++LocalClusterIndex)
+	{
+		uint SplatIndex;
+		bool bInBounds;
+		if (UseClusters != 0u)
+		{
+			const uint LocalSplatIndex = LocalClusterIndex * THREADGROUP_SIZE_1D + GroupThreadIndex;
+			SplatIndex = Cluster.SplatOffset + LocalSplatIndex;
+			bInBounds = LocalSplatIndex < Cluster.SplatCount;
+		}
+		else
+		{
+			SplatIndex = GetUnWrappedDispatchThreadId(GroupId, GroupThreadIndex, THREADGROUP_SIZE_1D);
+			bInBounds = SplatIndex < (uint)NumSplats;
+		}
+
+		bool bVisible = false;
+		uint4 Packed = 0;
+		if (bInBounds)
+		{
+			FGaussianSplatData Splat = UnpackGaussianSplatData(SplatIndex);
+			const float Opacity = saturate(Splat.Opacity * OpacityScale);
+			if (Opacity >= OpacityThreshold)
+			{
+				const float3 P = mul(float4(Splat.Position, 1.0f), LocalToWorld).xyz;
+				const float2 Center = float2(dot(CascadeU.xyz, P) + CascadeU.w, dot(CascadeV.xyz, P) + CascadeV.w);
+				const float Depth = dot(CascadeDepth.xyz, P) + CascadeDepth.w;
+
+				// Orthographic projection of the covariance: rows of M are the splat's world axes, A M^T M A^T with A the
+				// two texel axes
+				const float3x3 R = QuaternionToFloat3x3(Splat.Rotation);
+				const float3 S = Splat.Scale * PointScaleFactor;
+				const float3x3 M = mul(float3x3(R[0] * S.x, R[1] * S.y, R[2] * S.z), (float3x3)LocalToWorld);
+				const float3 A = mul(M, CascadeU.xyz);
+				const float3 B = mul(M, CascadeV.xyz);
+				const float3 Covariance2D = float3(dot(A, A) + GAUSSIAN_SPLAT_COVARIANCE_DILATION, dot(A, B), dot(B, B) + GAUSSIAN_SPLAT_COVARIANCE_DILATION);
+
+				float2 Axis0, Axis1;
+				if (Depth <= 1.0f && SG_DecomposeCovariance(Covariance2D, Axis0, Axis1, /* bClipAxis = */true, 1.0f))
+				{
+					const float2 Extent = GAUSSIAN_SPLAT_RADIUS * sqrt(Axis0 * Axis0 + Axis1 * Axis1);
+					bVisible = all(Center + Extent >= 0.0f) && all(Center - Extent <= CascadeResolution);
+					Packed = uint4(
+						PackUnorm16x2((Center / CascadeResolution + 0.5f) * 0.5f),
+						GaussianSplatPackHalf2(Axis0),
+						GaussianSplatPackHalf2(Axis1),
+						PackUnorm16x2(float2(Depth, Opacity)));
+				}
+			}
+		}
+
+		// Compact (group prefix sum, as the shading pass without wave ops)
+		uint GroupCount = 0;
+		const uint GroupIndex = ThreadGroupPrefixSum(bVisible ? 1u : 0u, GroupThreadIndex, GroupCount);
+		if (GroupThreadIndex == 0)
+		{
+			GroupWriteOffset = 0;
+			if (GroupCount > 0)
+			{
+				InterlockedAdd(RWShadowSplatCount[0], GroupCount, GroupWriteOffset);
+			}
+		}
+		GroupMemoryBarrierWithGroupSync();
+		const uint WriteIndex = GroupWriteOffset + GroupIndex;
+		if (bVisible && WriteIndex < MaxShadowSplats)
+		{
+			RWShadowSplats[WriteIndex] = Packed;
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+}
+
+Buffer<uint> ShadowSplatCount;
+RWBuffer<uint> RWDrawIndirectArgs;
+
+[numthreads(1, 1, 1)]
+void DrawArgsCS()
+{
+	WriteIndirectDrawArgs(RWDrawIndirectArgs, 0, 4u, min(ShadowSplatCount[0], MaxShadowSplats), 0u, 0u);
+}
+
+#else // !COMPUTESHADER
+
+#include "/Plugin/GaussianSplat/Shared/GaussianSplatDefinitions.h"
+#include "GaussianSplatCommon.ush"
+
+StructuredBuffer<uint4> ShadowSplats;
+float3 FalloffParameters;
+float DepthOpacityThreshold;
+
+float2 UnpackUnorm16x2(uint V)
+{
+	return float2(V & 0xFFFFu, V >> 16) * (1.0f / 65535.0f);
+}
+
+void ShadowVS(
+	uint VertexID : SV_VertexID,
+	uint InstanceID : SV_InstanceID,
+	out float4 OutPosition : SV_POSITION,
+	out float4 OutSplat : TEXCOORD0) // local uv, depth, opacity
+{
+	const uint4 Splat = ShadowSplats[InstanceID];
+	const float2 Center = (UnpackUnorm16x2(Splat.x) * 2.0f - 0.5f) * CascadeResolution;
+	const float2 Axis0 = GaussianSplatUnpackHalf2(Splat.y);
+	const float2 Axis1 = GaussianSplatUnpackHalf2(Splat.z);
+	const float2 Corner = float2((VertexID & 1u) ? 1.0f : -1.0f, (VertexID & 2u) ? 1.0f : -1.0f) * GAUSSIAN_SPLAT_RADIUS;
+	const float2 Texel = Center + Corner.x * Axis0 + Corner.y * Axis1;
+
+	OutPosition = float4(Texel / CascadeResolution * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.5f, 1.0f);
+	OutSplat = float4(Corner, UnpackUnorm16x2(Splat.w));
+}
+
+void ShadowPS(
+	float4 SvPosition : SV_POSITION,
+	float4 Splat : TEXCOORD0,
+	out float4 OutColor : SV_Target0)
+{
+	const float r2 = dot(Splat.xy, Splat.xy);
+	if (r2 >= GAUSSIAN_SPLAT_RADIUS_SQUARED)
+	{
+		discard;
+	}
+	const float Alpha = Splat.w * GaussianSplatFalloff(r2, FalloffParameters);
+	// Multiplied into the destination (transmittance); alpha is min-blended (nearest opaque depth)
+	OutColor = float4((1.0f - Alpha).xxx, Alpha >= DepthOpacityThreshold ? Splat.z : 1.0f);
+}
+
+float4 ShadowParams[GAUSSIAN_SPLAT_SHADOW_MAX_PARAMS];
+
+float4 WriteParamsPS(float4 SvPosition : SV_POSITION) : SV_Target0
+{
+	return ShadowParams[min((uint)SvPosition.x, (uint)(GAUSSIAN_SPLAT_SHADOW_MAX_PARAMS - 1))];
+}
+
+#endif // COMPUTESHADER

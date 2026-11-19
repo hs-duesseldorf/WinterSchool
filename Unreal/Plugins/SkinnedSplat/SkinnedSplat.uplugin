@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Skinned Splat",
+	"Description": "Skinned (rigged) Gaussian splats: standard 3DGS .ply + glTF skeleton, GPU dual-quaternion skinning, per-splat materials, rendered by Epic's GaussianSplat plugin in editor and game.",
+	"Category": "Rendering",
+	"CreatedBy": "WinterSchool",
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "SkinnedSplat",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "SkinnedSplatEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "GaussianSplat",
+			"Enabled": true
+		}
+	]
+}

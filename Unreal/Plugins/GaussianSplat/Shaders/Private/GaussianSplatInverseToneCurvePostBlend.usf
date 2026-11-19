@@ -1,0 +1,167 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Fused post-blend inverse tone curve + composite. Applies the inverse curve to the
+// splat scratch, then composites onto SceneColor via ROP premultiplied alpha-over.
+// Transmittance is carried in .a to match UE SceneColor convention.
+
+#define LUT_SAMPLER_TRILINEAR    0
+#define LUT_SAMPLER_TETRAHEDRAL  1
+#define LUT_SAMPLER              LUT_SAMPLER_TRILINEAR
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/ColorSpace.ush"
+
+Texture2D    SplatColor_Texture;
+SamplerState SplatColor_Sampler;
+
+// Inverse of UE's forward tone curve: samples display-referred linear input in [0,1]
+// and returns scene-linear values, so the later tonemap cancels back to the original
+// display color.
+Texture3D    InverseToneCurveLUT;
+SamplerState InverseToneCurveLUTSampler;
+
+FScreenTransform SvPositionToInputTextureUV;
+
+static const float kOpacityEpsilon = 1e-5f;
+
+// 0 = no inversion; 1 = full LUT-sampled inverse.
+float Strength;
+
+// Per-axis grid size of the (cubic) LUT.
+float InverseToneCurveLUTEdge;
+
+// Working color space -> sRGB linear. The LUT is baked against sRGB primaries (D65),
+// so non-sRGB projects must transform before sampling. The reverse transform ships
+// as SRGBColorToWorkingColorSpace in ColorSpace.ush.
+float3 WorkingColorSpaceColorToSRGB(float3 ColorWCS)
+{
+#if WORKING_COLOR_SPACE_IS_SRGB
+	return ColorWCS;
+#else
+	return mul(XYZ_2_Linear_sRGB_MAT, LinearRGB_2_XYZ(ColorWCS));
+#endif
+}
+
+// Trilinear: hardware sampler with center-of-texel UVW remap.
+float3 SampleLUT_Trilinear(float3 ColorClamped, float Edge)
+{
+	const float3 UVW = ColorClamped * ((Edge - 1.0f) / Edge)
+	                 + (0.5f / Edge);
+	return InverseToneCurveLUT.SampleLevel(InverseToneCurveLUTSampler, UVW, 0).rgb;
+}
+
+// Tetrahedral 6-tet barycentric. Each branch picks the tet containing
+// (d.r, d.g, d.b) by ordering and fetches the 2 unique intermediate corners.
+// c0 and c7 are shared across all tets.
+float3 SampleLUT_Tetrahedral(float3 ColorClamped, float Edge)
+{
+	const int N = (int)Edge;
+	const float3 GridPos = ColorClamped * (Edge - 1.0f);
+	const int3 B = clamp(int3(floor(GridPos)), int3(0, 0, 0), int3(N - 2, N - 2, N - 2));
+	const float3 d = saturate(GridPos - B);
+
+	const float3 c0 = InverseToneCurveLUT.Load(int4(B, 0)).rgb;
+	const float3 c7 = InverseToneCurveLUT.Load(int4(B + int3(1, 1, 1), 0)).rgb;
+
+	if (d.x > d.y)
+	{
+		if (d.y > d.z)
+		{
+			// r > g > b
+			const float3 c1 = InverseToneCurveLUT.Load(int4(B + int3(1, 0, 0), 0)).rgb;
+			const float3 c3 = InverseToneCurveLUT.Load(int4(B + int3(1, 1, 0), 0)).rgb;
+			return c0 + d.x * (c1 - c0) + d.y * (c3 - c1) + d.z * (c7 - c3);
+		}
+		else if (d.x > d.z)
+		{
+			// r > b >= g
+			const float3 c1 = InverseToneCurveLUT.Load(int4(B + int3(1, 0, 0), 0)).rgb;
+			const float3 c5 = InverseToneCurveLUT.Load(int4(B + int3(1, 0, 1), 0)).rgb;
+			return c0 + d.x * (c1 - c0) + d.z * (c5 - c1) + d.y * (c7 - c5);
+		}
+		else
+		{
+			// b >= r > g
+			const float3 c4 = InverseToneCurveLUT.Load(int4(B + int3(0, 0, 1), 0)).rgb;
+			const float3 c5 = InverseToneCurveLUT.Load(int4(B + int3(1, 0, 1), 0)).rgb;
+			return c0 + d.z * (c4 - c0) + d.x * (c5 - c4) + d.y * (c7 - c5);
+		}
+	}
+	else
+	{
+		if (d.z > d.y)
+		{
+			// b > g >= r
+			const float3 c4 = InverseToneCurveLUT.Load(int4(B + int3(0, 0, 1), 0)).rgb;
+			const float3 c6 = InverseToneCurveLUT.Load(int4(B + int3(0, 1, 1), 0)).rgb;
+			return c0 + d.z * (c4 - c0) + d.y * (c6 - c4) + d.x * (c7 - c6);
+		}
+		else if (d.z > d.x)
+		{
+			// g >= b > r
+			const float3 c2 = InverseToneCurveLUT.Load(int4(B + int3(0, 1, 0), 0)).rgb;
+			const float3 c6 = InverseToneCurveLUT.Load(int4(B + int3(0, 1, 1), 0)).rgb;
+			return c0 + d.y * (c2 - c0) + d.z * (c6 - c2) + d.x * (c7 - c6);
+		}
+		else
+		{
+			// g >= r >= b
+			const float3 c2 = InverseToneCurveLUT.Load(int4(B + int3(0, 1, 0), 0)).rgb;
+			const float3 c3 = InverseToneCurveLUT.Load(int4(B + int3(1, 1, 0), 0)).rgb;
+			return c0 + d.y * (c2 - c0) + d.x * (c3 - c2) + d.z * (c7 - c3);
+		}
+	}
+}
+
+float3 SampleInverseToneCurveLUT(float3 ColorClamped, float Edge)
+{
+#if LUT_SAMPLER == LUT_SAMPLER_TETRAHEDRAL
+	return SampleLUT_Tetrahedral(ColorClamped, Edge);
+#else
+	return SampleLUT_Trilinear(ColorClamped, Edge);
+#endif
+}
+
+#ifndef APPLY_INVERSE_TONE_CURVE
+#define APPLY_INVERSE_TONE_CURVE 1
+#endif // APPLY_INVERSE_TONE_CURVE
+
+void MainPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	const float2 TextureUV = ApplyScreenTransform(SvPosition.xy, SvPositionToInputTextureUV);
+	const float4 Splat     = SplatColor_Texture.SampleLevel(SplatColor_Sampler, TextureUV, 0);
+
+	// Scratch RT stores transmittance in .a to match UE SceneColor convention.
+	const float Transmittance = Splat.a;
+	const float Opacity       = 1.0f - Transmittance;
+
+	if (Opacity < kOpacityEpsilon)
+	{
+		// Fully transparent splat pixel: skip the ROP write entirely.
+		discard;
+		return;
+	}
+
+	// Note: Unpremultiplying/premultiplying (now removed) introduced visible artifacts
+	// in splat translucent gradients.
+
+	// Undo pre-exposure -> WCS->sRGB -> saturate (clip out-of-gamut) -> inverse LUT
+	// -> sRGB->WCS -> lerp by strength -> reapply pre-exposure.
+	const float3 Color        = Splat.rgb * View.OneOverPreExposure;
+#if APPLY_INVERSE_TONE_CURVE
+	const float3 ColorSRGB    = WorkingColorSpaceColorToSRGB(Color);
+	const float3 InversedSRGB = SampleInverseToneCurveLUT(saturate(ColorSRGB), InverseToneCurveLUTEdge);
+	const float3 Inversed     = SRGBColorToWorkingColorSpace(InversedSRGB);
+	const float3 Blended      = lerp(Color, Inversed, Strength);
+#else
+	// Fall-through implementation composites the original color
+	const float3 Blended      = Color;
+#endif
+
+	// Output alpha stays as transmittance for the ROP blend (One, SrcAlpha) /
+	// (Zero, SrcAlpha) so transmittances multiply correctly into SceneColor.
+	OutColor = float4(Blended * View.PreExposure, Transmittance);
+}

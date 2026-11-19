@@ -1,0 +1,400 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/BlueNoise.ush"
+#include "/Engine/Private/OctahedralCommon.ush"
+
+#include "GaussianSplatCommon.ush"
+
+#ifndef USE_BLUE_NOISE
+#define USE_BLUE_NOISE 0
+#endif // USE_BLUE_NOISE
+
+#ifndef WRITE_STOCHASTIC_DEPTH
+#define WRITE_STOCHASTIC_DEPTH 0
+#endif // WRITE_STOCHASTIC_DEPTH
+
+#ifndef WRITE_EXPECTED_DEPTH
+#define WRITE_EXPECTED_DEPTH 0
+#endif // WRITE_EXPECTED_DEPTH
+
+#ifndef WRITE_VELOCITY
+#define WRITE_VELOCITY 0
+#endif // WRITE_VELOCITY
+
+#ifndef GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS
+#define GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS 0
+#endif // GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS
+
+#ifndef GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+#define GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH 0
+#endif // GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+
+#ifndef GAUSSIAN_SPLAT_SUPERSAMPLE
+#define GAUSSIAN_SPLAT_SUPERSAMPLE 0
+#endif // GAUSSIAN_SPLAT_SUPERSAMPLE
+
+// GBuffer path (WinterSchool fork): the splats also carry their surface (normal, lighting strength) to the pixel shader
+#ifndef GAUSSIAN_SPLAT_DEFERRED
+#define GAUSSIAN_SPLAT_DEFERRED 0
+#endif // GAUSSIAN_SPLAT_DEFERRED
+
+float OpacityThreshold;
+float ExpectedDepthScale;
+float3 FalloffParameters;
+int SuperSampleGrid;
+#if !GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+StructuredBuffer<FPackedShadedGaussianSplatData> ShadedGaussianSplatBuffer;
+#if !GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS
+Buffer<uint> SortedIndexBuffer;
+#endif // !GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS
+#endif // !GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+#if GAUSSIAN_SPLAT_DEFERRED
+// Written by the shading pass, see ComputeSplatSurface: x = octahedral unorm16x2 normal, y = half lighting strength
+StructuredBuffer<uint2> ShadedSplatSurfaceBuffer;
+#endif // GAUSSIAN_SPLAT_DEFERRED
+
+static const float2 QuadCorners[4] =
+{
+	float2(-1, -1),
+	float2(+1, -1),
+	float2(-1, +1),
+	float2(+1, +1),
+};
+
+struct FVertexOutput
+{
+	float4 Position : SV_Position;
+	float2 LocalUV : TEXCOORD0;
+	float4 Color : TEXCOORD1;
+	nointerpolation uint SplatIndex : TEXCOORD2;
+#if GAUSSIAN_SPLAT_DEFERRED
+	// xyz: world normal, w: lighting strength
+	nointerpolation float4 Surface : TEXCOORD3;
+	// Camera-relative translated world ray through the pixel, scaled to unit view depth (linear across the quad)
+	float3 ViewRay : TEXCOORD4;
+	// x: dot(normal, camera-relative centre), y: view depth of the centre, z: depth range allowed around it
+	nointerpolation float3 DepthPlane : TEXCOORD5;
+#endif
+};
+
+#if GAUSSIAN_SPLAT_DEFERRED
+// Ray from the camera through an NDC position, in translated world space, scaled so its view depth is 1
+float3 NDCToTranslatedWorldRay(float2 NDC)
+{
+	const float3 ViewRay = float3(
+		(NDC.x - PrimaryView.ViewToClip[2][0]) / PrimaryView.ViewToClip[0][0],
+		(NDC.y - PrimaryView.ViewToClip[2][1]) / PrimaryView.ViewToClip[1][1],
+		1.0f);
+	return mul(ViewRay, (float3x3)PrimaryView.ViewToTranslatedWorld);
+}
+#endif // GAUSSIAN_SPLAT_DEFERRED
+
+FVertexOutput CreateGaussianSplatVertex(FShadedGaussianSplatData SplatData, uint VertexID, uint SplatIndex)
+{
+	FVertexOutput Output;
+
+	// Discard if behind camera
+	if (SplatData.Position.w <= 0.0f)
+	{
+		Output.Position = 0;
+		Output.LocalUV  = 0;
+		Output.Color = 0;
+		Output.SplatIndex = 0;
+#if GAUSSIAN_SPLAT_DEFERRED
+		Output.Surface = 0;
+		Output.ViewRay = 0;
+		Output.DepthPlane = 0;
+#endif
+		return Output;
+	}
+
+	float2 Corner = QuadCorners[VertexID & 3];
+	Output.LocalUV = Corner * GAUSSIAN_SPLAT_RADIUS;
+
+	float W = SplatData.Position.w;
+	float2 Axis0 = SplatData.Axes.xy * float2(1, -1);
+	float2 Axis1 = SplatData.Axes.zw * float2(1, -1);
+
+	float2 CornerOffsetPixels = Corner.x * GAUSSIAN_SPLAT_RADIUS * Axis0 + Corner.y * GAUSSIAN_SPLAT_RADIUS * Axis1;
+	float2 CornerOffsetNDC = CornerOffsetPixels * PrimaryView.ViewSizeAndInvSize.zw * float2(2, -2);
+
+	float2 CenterNDC = SplatData.Position.xy / W;
+	float2 CornerNDC = CenterNDC + CornerOffsetNDC;
+
+	// Clip-space position and color
+	Output.Position = float4(CornerNDC * W, SplatData.Position.z, W);
+	Output.Color = SplatData.Color;
+	Output.SplatIndex = SplatIndex;
+#if GAUSSIAN_SPLAT_DEFERRED
+	Output.Surface = 0;
+	Output.ViewRay = 0;
+	Output.DepthPlane = 0;
+#endif
+
+	return Output;
+}
+
+FVertexOutput MainVS(
+	uint VertexID : SV_VertexID,
+	uint InstanceID : SV_InstanceID
+#if GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+	// Per-instance stream matching FPackedShadedGaussianSplatData's 24-byte layout.
+	, uint2 InViewZAndNDC : ATTRIBUTE0
+	, uint2 InAxes        : ATTRIBUTE1
+	, uint2 InColor       : ATTRIBUTE2
+#endif // GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+)
+{
+	FPackedShadedGaussianSplatData PackedSplatData;
+
+#if GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+	PackedSplatData.ViewZ = asfloat(InViewZAndNDC.x);
+	PackedSplatData.NDC   = InViewZAndNDC.y;
+	PackedSplatData.Axes  = InAxes;
+	PackedSplatData.Color = InColor;
+	const uint SplatIndex = InstanceID;
+#elif GAUSSIAN_SPLAT_GATHER_SHADED_SPLATS
+	// Records are already in sorted order: read them sequentially.
+	const uint SplatIndex = InstanceID;
+	PackedSplatData = ShadedGaussianSplatBuffer[SplatIndex];
+#else
+	const uint SplatIndex = SortedIndexBuffer[InstanceID];
+	PackedSplatData = ShadedGaussianSplatBuffer[SplatIndex];
+#endif // GAUSSIAN_SPLAT_VERTEX_ATTRIBUTE_FETCH
+
+	const FShadedGaussianSplatData SplatData = UnpackShadedGaussianSplat(PackedSplatData);
+	FVertexOutput Output = CreateGaussianSplatVertex(SplatData, VertexID, SplatIndex);
+#if GAUSSIAN_SPLAT_DEFERRED
+	const uint2 PackedSurface = ShadedSplatSurfaceBuffer[SplatIndex];
+	const float2 Oct = float2(PackedSurface.x & 0xFFFFu, PackedSurface.x >> 16) * (2.0f / 65535.0f) - 1.0f;
+	Output.Surface = float4(OctahedronToUnitVector(Oct), f16tof32(PackedSurface.y & 0xFFFFu));
+
+	// The depth of a splat is its plane (centre, normal) along each pixel's ray rather than the depth of its centre. With
+	// the centre depth, the front splats of a surface seen at a grazing angle win the blend, and the surface ends up in
+	// front of where it is by a fraction of the splat size (growing with the level of detail, so with distance).
+	if (SplatData.Position.w > 0.0f)
+	{
+		const float W = SplatData.Position.w;
+		Output.ViewRay = NDCToTranslatedWorldRay(Output.Position.xy / W);
+		const float2 Axis0 = SplatData.Axes.xy;
+		const float2 Axis1 = SplatData.Axes.zw;
+		const float RadiusPixels = GAUSSIAN_SPLAT_RADIUS * sqrt(max(dot(Axis0, Axis0), dot(Axis1, Axis1)));
+		const float Extent = RadiusPixels * W * 2.0f * PrimaryView.ViewSizeAndInvSize.z / PrimaryView.ViewToClip[0][0];
+		Output.DepthPlane = float3(dot(Output.Surface.xyz, NDCToTranslatedWorldRay(SplatData.Position.xy / W)) * W, W, Extent);
+	}
+#endif
+	return Output;
+}
+
+#if GAUSSIAN_SPLAT_SUPERSAMPLE
+float SuperSampledSplatWeight(float2 LocalUV)
+{
+	const float2 dUVdx = ddx(LocalUV);
+	const float2 dUVdy = ddy(LocalUV);
+	const float Step = 1.0f / (float) SuperSampleGrid;
+
+	float Weight = 0.0f;
+	for (int y = 0; y < SuperSampleGrid; ++y)
+	{
+		for (int x = 0; x < SuperSampleGrid; ++x)
+		{
+			const float2 Offset = (float2(x, y) + 0.5f) * Step - 0.5f;
+			const float2 UV = LocalUV + dUVdx * Offset.x + dUVdy * Offset.y;
+			const float r2 = dot(UV, UV);
+			Weight += (r2 < GAUSSIAN_SPLAT_RADIUS_SQUARED) ? GaussianSplatFalloff(r2, FalloffParameters) : 0.0f;
+		}
+	}
+	return Weight * Step * Step;
+}
+#endif // GAUSSIAN_SPLAT_SUPERSAMPLE
+
+float WangHash(uint2 PixelCoord, uint Seed)
+{
+	uint S = PixelCoord.x * 1973u + PixelCoord.y * 9277u + Seed * 26699u;
+	S = (S ^ 61u) ^ (S >> 16u);
+	S *= 9u;
+	S ^= (S >> 4u);
+	S *= 0x27d4eb2du;
+	S ^= (S >> 15u);
+	return float(S & 0x00FFFFFFu) / float(0x01000000u);
+}
+
+void MainPS(
+	FVertexOutput Input,
+	out float4 OutColor : SV_Target0
+#if WRITE_STOCHASTIC_DEPTH
+	, out float OutDepth : SV_Target1
+#elif WRITE_EXPECTED_DEPTH
+	, out float4 OutDepthMoments : SV_Target1
+#endif
+#if WRITE_VELOCITY
+	, out float4 OutVelocity : SV_Target1
+#endif
+)
+{
+#if GAUSSIAN_SPLAT_SUPERSAMPLE
+	float SplatWeight = SuperSampledSplatWeight(Input.LocalUV);
+	if (SplatWeight <= 0.0f)
+	{
+		discard;
+	}
+#else
+	float r2 = dot(Input.LocalUV, Input.LocalUV);
+	if (r2 >= GAUSSIAN_SPLAT_RADIUS_SQUARED)
+	{
+		discard;
+	}
+
+	float SplatWeight = GaussianSplatFalloff(r2, FalloffParameters);
+#endif
+	float SrcAlpha    = Input.Color.a * SplatWeight;
+	if (SrcAlpha < OpacityThreshold)
+	{
+		discard;
+	}
+
+	// Premultiplied alpha
+	OutColor = float4(Input.Color.rgb * SrcAlpha * View.PreExposure, SrcAlpha);
+
+#if WRITE_STOCHASTIC_DEPTH
+	#if USE_BLUE_NOISE
+		float RandSample = BlueNoiseScalar((uint2) Input.Position.xy, View.StateFrameIndex + Input.SplatIndex);
+	#else
+		float RandSample = WangHash((uint2) Input.Position.xy, View.StateFrameIndex ^ (Input.SplatIndex * 2654435761u));
+	#endif
+	OutDepth = (RandSample < SrcAlpha) ? Input.Position.z : 0.0f;
+	
+#elif WRITE_EXPECTED_DEPTH
+	float LinearZ = ConvertFromDeviceZ(Input.Position.z) / ExpectedDepthScale;
+	OutDepthMoments = float4(LinearZ * SrcAlpha, 0.0f, 0.0f, SrcAlpha);
+#endif
+	
+#if WRITE_VELOCITY
+	OutVelocity = (float4) 0;
+#endif
+}
+
+void MainPS_StochasticDepth(
+	FVertexOutput Input
+#if WRITE_VELOCITY
+	, out float4 OutVelocity : SV_Target0
+#endif
+)
+{
+	float r2 = dot(Input.LocalUV, Input.LocalUV);
+	if (r2 >= GAUSSIAN_SPLAT_RADIUS_SQUARED)
+	{
+		discard;
+	}
+
+	float SplatWeight = GaussianSplatFalloff(r2, FalloffParameters);
+	float Alpha       = Input.Color.a * SplatWeight;
+
+#if USE_BLUE_NOISE
+		float RandSample = BlueNoiseScalar((uint2) Input.Position.xy, View.StateFrameIndex + Input.SplatIndex);
+#else
+	float RandSample = WangHash((uint2) Input.Position.xy, View.StateFrameIndex ^ (Input.SplatIndex * 2654435761u));
+#endif
+	if (RandSample >= Alpha)
+	{
+		discard;
+	}
+
+#if WRITE_VELOCITY
+	// Write sentinel value, enforcing camera-motion only for the fragment
+	OutVelocity = (float4) 0;
+#endif
+}
+
+Texture2D<float4> DepthMomentsTexture;
+
+void MainPS_ExpectedDepth(
+	float4 SvPosition : SV_Position,
+	out float OutDepth : SV_Depth)
+{
+	float4 Moments = DepthMomentsTexture.Load(int3((int2) SvPosition.xy, 0));
+	float Numerator = Moments.r;
+	float Denominator = 1.0f - Moments.a;
+	if (Denominator <= 1e-5f)
+	{
+		discard;
+	}
+	float ExpectedDepth = (Numerator / Denominator) * ExpectedDepthScale;
+	OutDepth = ConvertToDeviceZ(ExpectedDepth);
+}
+
+Texture2D<float> DepthTexture;
+
+void MainPS_ResolveDepth(
+	float4 SvPosition : SV_Position,
+	out float OutDepth : SV_Depth
+#if WRITE_VELOCITY
+	, out float4 OutVelocity : SV_Target0
+#endif
+)
+{
+	float Depth = DepthTexture.Load(int3((int2) SvPosition.xy, 0));
+	if (Depth <= 0.0f)
+	{
+		discard;
+	}
+	OutDepth = Depth;
+
+#if WRITE_VELOCITY
+	OutVelocity = (float4) 0;
+#endif
+}
+
+void MainPS_ResolveVelocity(
+	float4 SvPosition : SV_Position,
+	out float4 OutVelocity : SV_Target0)
+{
+	float Coverage   = 1.0f - DepthMomentsTexture.Load(int3((int2) SvPosition.xy, 0)).a;
+#if USE_BLUE_NOISE
+	float RandSample = BlueNoiseScalar((uint2) SvPosition.xy, View.StateFrameIndex);
+#else
+	float RandSample = WangHash((uint2) SvPosition.xy, View.StateFrameIndex);
+#endif
+	
+	if (RandSample >= Coverage)
+	{
+		discard;
+	}
+	OutVelocity = (float4) 0;
+}
+
+#if GAUSSIAN_SPLAT_DEFERRED
+// GBuffer path (WinterSchool fork): front to back with the UNDER operator (dst.rgb += src.rgb * dst.a, dst.a *= 1 - src.a,
+// targets cleared to (0, 0, 0, 1)), so every target ends up with its quantity averaged over the visible splats, weighted by
+// how much each one is seen, and the transmittance left in .a. GaussianSplatDeferred.usf resolves them into the GBuffer.
+void MainPS_Deferred(
+	FVertexOutput Input,
+	out float4 OutColor : SV_Target0,
+	out float4 OutDepthAndLighting : SV_Target1,
+	out float4 OutNormal : SV_Target2)
+{
+	const float r2 = dot(Input.LocalUV, Input.LocalUV);
+	if (r2 >= GAUSSIAN_SPLAT_RADIUS_SQUARED)
+	{
+		discard;
+	}
+
+	const float SrcAlpha = Input.Color.a * GaussianSplatFalloff(r2, FalloffParameters);
+	if (SrcAlpha < OpacityThreshold)
+	{
+		discard;
+	}
+
+	OutColor = float4(Input.Color.rgb * SrcAlpha * View.PreExposure, SrcAlpha);
+	// Ray / splat plane, within the splat (the normal faces the camera, so both terms are negative in front of it)
+	const float PlaneDepth = Input.DepthPlane.x / min(dot(Input.Surface.xyz, Input.ViewRay), -1e-6f);
+	const float LinearZ = clamp(PlaneDepth, Input.DepthPlane.y - Input.DepthPlane.z, Input.DepthPlane.y + Input.DepthPlane.z) / ExpectedDepthScale;
+	// Depth is averaged with its own weight, the opacity to the 4th: an alpha weighted average lets faint splats in front
+	// (floaters, out of focus foliage near the camera) pull the surface far towards the camera, more so the further away it
+	// is, and lights and shadows are then evaluated in mid air. (x16 keeps faint weights out of fp16 denormals.)
+	const float DepthWeight = 16.0f * Pow4(SrcAlpha);
+	OutDepthAndLighting = float4(LinearZ * DepthWeight, Input.Surface.w * SrcAlpha, DepthWeight, SrcAlpha);
+	OutNormal = float4(Input.Surface.xyz * SrcAlpha, SrcAlpha);
+}
+#endif // GAUSSIAN_SPLAT_DEFERRED

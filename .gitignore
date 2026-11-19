@@ -1,19 +1,22 @@
 # Unreal generated
-Binaries/
-Intermediate/
-Saved/
-DerivedDataCache/
-Build/*
-!Build/Wasm/
-Build/Wasm/*
-!Build/Wasm/Template/
-Plugins/*/Binaries/
-Plugins/*/Intermediate/
+Unreal/Binaries/
+Unreal/Intermediate/
+Unreal/Saved/
+Unreal/DerivedDataCache/
+Unreal/Build/*
+!Unreal/Build/Wasm/
+Unreal/Build/Wasm/*
+!Unreal/Build/Wasm/Template/
+Unreal/Plugins/*/Binaries/
+Unreal/Plugins/*/Intermediate/
+Unreal/Makefile
 # Packaged web build
-WebBuild/
+Unreal/WebBuild/
 # Script logs
-Scripts/logs/
+Unreal/Scripts/logs/
 __pycache__/
+# Pipeline install (envs, models, ComfyUI, outputs), local only
+Pipeline/work
 # IDE
 .vs/
 .vscode/

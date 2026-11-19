@@ -1,0 +1,32 @@
+{
+	"FileVersion": 3,
+	"Version": 14,
+	"VersionName": "2025-06-17",
+	"FriendlyName": "CapturyLiveLink",
+	"Description": "Stream from Captury Live / Captury Replay using the Live Link framework (Captury's plugin, built from source for this project)",
+	"Category": "Other",
+	"CreatedBy": "Captury",
+	"CreatedByURL": "https://captury.com",
+	"DocsURL": "http://doc.captury.com/CapturyLive/livestreaming.html",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"Modules": [
+		{
+			"Name": "CapturyLiveLink",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Android",
+				"Linux",
+				"Mac"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "LiveLink",
+			"Enabled": true
+		}
+	]
+}

@@ -1,0 +1,354 @@
+{
+ "last_node_id": 6,
+ "last_link_id": 4,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "Note",
+   "pos": [
+    60,
+    -460
+   ],
+   "size": [
+    2200,
+    320
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "title": "Person -> Gaussian splat",
+   "inputs": [],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "Note"
+   },
+   "widgets_values": [
+    "Prompt (+ optional photo) -> Gaussian splat, in four steps. Press Queue (Run).\n\n1 Image   FLUX.2 Klein: the person in an A-pose in a grey studio (from the photo if one is connected)\n2 Views   side and back views on the same grey: scout orbit, cut out, re-lit\n3 Video   MiniMax H3 circles the person, pinned to those views\n4 Splat   upscale, masks, matte, camera poses, training, clean-up, export\n\nEach step keeps its result in ComfyUI/output/profsplat/<run>/ and is skipped while its settings and inputs are unchanged: change one setting and only that step and the ones after it run again.\ndry_run (node 1): generates nothing, shows the stored result of every step of the professor run."
+   ]
+  },
+  {
+   "id": 2,
+   "type": "LoadImage",
+   "pos": [
+    60,
+    640
+   ],
+   "size": [
+    460,
+    640
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "title": "Photo (optional)",
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "MASK",
+     "type": "MASK",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "Professor_hero.png",
+    "image"
+   ]
+  },
+  {
+   "id": 3,
+   "type": "PSImage",
+   "pos": [
+    60,
+    0
+   ],
+   "size": [
+    460,
+    600
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "title": "1 \u00b7 Image",
+   "inputs": [
+    {
+     "name": "photo",
+     "type": "IMAGE",
+     "link": 1
+    }
+   ],
+   "outputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "links": [
+      2
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "image",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PSImage"
+   },
+   "widgets_values": [
+    "professor",
+    "A man in his sixties with short, side-parted dark-blond hair going grey, a friendly lined face and blue eyes. He wears a navy-blue short-sleeved polo shirt, loose light-grey chino trousers, beige-grey sneakers and a black wristwatch on his left wrist.",
+    "reference",
+    1,
+    "fixed",
+    4,
+    true
+   ]
+  },
+  {
+   "id": 4,
+   "type": "PSViews",
+   "pos": [
+    640,
+    0
+   ],
+   "size": [
+    460,
+    900
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "title": "2 \u00b7 Views",
+   "inputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "link": 2
+    }
+   ],
+   "outputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "views",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PSViews"
+   },
+   "widgets_values": [
+    "climb",
+    "grey keyframes",
+    1,
+    "fixed",
+    "auto",
+    0.7,
+    0.3
+   ]
+  },
+  {
+   "id": 5,
+   "type": "PSVideo",
+   "pos": [
+    1220,
+    0
+   ],
+   "size": [
+    460,
+    900
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "title": "3 \u00b7 360\u00b0 Video",
+   "inputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "link": 3
+    }
+   ],
+   "outputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "links": [
+      4
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PSVideo"
+   },
+   "widgets_values": [
+    1,
+    "fixed",
+    8
+   ]
+  },
+  {
+   "id": 6,
+   "type": "PSSplat",
+   "pos": [
+    1800,
+    0
+   ],
+   "size": [
+    460,
+    1300
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "title": "4 \u00b7 Gaussian Splat",
+   "inputs": [
+    {
+     "name": "pipe",
+     "type": "PROFSPLAT",
+     "link": 4
+    }
+   ],
+   "outputs": [
+    {
+     "name": "views",
+     "type": "IMAGE",
+     "links": [],
+     "slot_index": 0
+    },
+    {
+     "name": "folder",
+     "type": "STRING",
+     "links": [],
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "PSSplat"
+   },
+   "widgets_values": [
+    1.78,
+    true,
+    130000,
+    2.0
+   ]
+  }
+ ],
+ "links": [
+  [
+   1,
+   2,
+   0,
+   3,
+   0,
+   "IMAGE"
+  ],
+  [
+   2,
+   3,
+   0,
+   4,
+   0,
+   "PROFSPLAT"
+  ],
+  [
+   3,
+   4,
+   0,
+   5,
+   0,
+   "PROFSPLAT"
+  ],
+  [
+   4,
+   5,
+   0,
+   6,
+   0,
+   "PROFSPLAT"
+  ]
+ ],
+ "groups": [
+  {
+   "title": "1  Image",
+   "bounding": [
+    30.0,
+    -60,
+    520,
+    1380
+   ],
+   "color": "#3f789e",
+   "font_size": 24,
+   "flags": {}
+  },
+  {
+   "title": "2  Views",
+   "bounding": [
+    610.0,
+    -60,
+    520,
+    1380
+   ],
+   "color": "#8a6d3b",
+   "font_size": 24,
+   "flags": {}
+  },
+  {
+   "title": "3  360\u00b0 Video",
+   "bounding": [
+    1190.0,
+    -60,
+    520,
+    1380
+   ],
+   "color": "#a1309b",
+   "font_size": 24,
+   "flags": {}
+  },
+  {
+   "title": "4  Gaussian Splat",
+   "bounding": [
+    1770.0,
+    -60,
+    520,
+    1380
+   ],
+   "color": "#3f8f5f",
+   "font_size": 24,
+   "flags": {}
+  }
+ ],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 0.6,
+   "offset": [
+    40,
+    40
+   ]
+  }
+ },
+ "version": 0.4
+}
