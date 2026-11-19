@@ -5,7 +5,6 @@ Winter School 2027: a generated, rigged Gaussian-splat professor, rendered in Un
 ## Unreal/
 UE 5.9 project (Wasm build). Plugins: `SkinnedSplat` (skinned splat rendering), `GaussianSplat`, `CapturyLiveLink` (mocap).
 - `Scripts/build_web.sh` / `play_web.sh`: package and serve the web build. Paths in `Scripts/config.sh`.
-- `Scripts/import_professor.sh`, `import_temple.sh`, `retarget_anims.sh`: import the professor rig, the Saka Shrine world, mocap.
 - World: "Saka Shrine" by kotohibi, CC BY 4.0 (stored via Git LFS).
 
 ## Pipeline/
